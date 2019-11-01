@@ -1,7 +1,6 @@
 package types
 
 import (
-	"bytes"
 	"encoding/binary"
 	"reflect"
 	"strconv"
@@ -17,22 +16,19 @@ import (
 // is chosen as the default value given its simplicity to represent unbounded size.
 var UnboundedSSZFieldSizeMarker = "?"
 
-type structSSZ struct {
-	hashCache map[string]interface{}
-}
+type structSSZ struct{}
 
 func newStructSSZ() *structSSZ {
-	return &structSSZ{
-		hashCache: make(map[string]interface{}),
-	}
+	return &structSSZ{}
 }
 
-func (b *structSSZ) Root(val reflect.Value, typ reflect.Type, maxCapacity uint64) ([32]byte, error) {
+func (b *structSSZ) Root(val reflect.Value, typ reflect.Type, fieldName string, maxCapacity uint64) ([32]byte, error) {
 	if typ.Kind() == reflect.Ptr {
 		if val.IsNil() {
-			return [32]byte{}, nil
+			instance := reflect.New(typ.Elem()).Elem()
+			return b.Root(instance, instance.Type(), fieldName, maxCapacity)
 		}
-		return b.Root(val.Elem(), typ.Elem(), maxCapacity)
+		return b.Root(val.Elem(), typ.Elem(), fieldName, maxCapacity)
 	}
 	numFields := typ.NumField()
 	return b.FieldsHasher(val, typ, numFields)
@@ -42,6 +38,7 @@ func (b *structSSZ) FieldsHasher(val reflect.Value, typ reflect.Type, numFields 
 	roots := make([][]byte, numFields)
 	var err error
 	totalCountedFields := uint64(0)
+	structName := typ.Name()
 	for i := 0; i < numFields; i++ {
 		// We skip protobuf related metadata fields.
 		if strings.Contains(typ.Field(i).Name, "XXX_") {
@@ -49,8 +46,8 @@ func (b *structSSZ) FieldsHasher(val reflect.Value, typ reflect.Type, numFields 
 		}
 		totalCountedFields++
 		fCapacity := determineFieldCapacity(typ.Field(i))
-		if typ.Field(i).Name == "AggregationBits" || typ.Field(i).Name == "CustodyBits" {
-			r, err := bitlistRoot(val.Field(i), fCapacity)
+		if b, ok := val.Field(i).Interface().(bitfield.Bitlist); ok {
+			r, err := BitlistRoot(b, fCapacity)
 			if err != nil {
 				return [32]byte{}, nil
 			}
@@ -65,7 +62,7 @@ func (b *structSSZ) FieldsHasher(val reflect.Value, typ reflect.Type, numFields 
 		if err != nil {
 			return [32]byte{}, err
 		}
-		r, err := factory.Root(val.Field(i), fType, fCapacity)
+		r, err := factory.Root(val.Field(i), fType, structName+"."+typ.Field(i).Name, fCapacity)
 		if err != nil {
 			return [32]byte{}, err
 		}
@@ -102,7 +99,12 @@ func (b *structSSZ) Marshal(val reflect.Value, typ reflect.Type, buf []byte, sta
 		if isVariableSizeType(fType) {
 			fixedLength += BytesPerLengthOffset
 		} else {
-			fixedLength += determineFixedSize(val.Field(i), fType)
+			if val.Type().Kind() == reflect.Ptr && val.IsNil() {
+				elem := reflect.New(val.Type().Elem()).Elem()
+				fixedLength += determineFixedSize(elem, fType)
+			} else {
+				fixedLength += determineFixedSize(val.Field(i), fType)
+			}
 		}
 	}
 	currentOffsetIndex := startOffset + fixedLength
@@ -246,34 +248,6 @@ func (b *structSSZ) Unmarshal(val reflect.Value, typ reflect.Type, input []byte,
 		}
 	}
 	return currentIndex, nil
-}
-
-func bitlistRoot(val reflect.Value, maxCapacity uint64) ([32]byte, error) {
-	limit := (maxCapacity + 255) / 256
-	if val.IsNil() {
-		length := make([]byte, 32)
-		root, err := bitwiseMerkleize([][]byte{}, 0, limit)
-		if err != nil {
-			return [32]byte{}, err
-		}
-		return mixInLength(root, length), nil
-	}
-	bfield := val.Interface().(bitfield.Bitlist)
-	chunks, err := pack([][]byte{bfield.Bytes()})
-	if err != nil {
-		return [32]byte{}, err
-	}
-	buf := new(bytes.Buffer)
-	if err := binary.Write(buf, binary.LittleEndian, bfield.Len()); err != nil {
-		return [32]byte{}, err
-	}
-	output := make([]byte, 32)
-	copy(output, buf.Bytes())
-	root, err := bitwiseMerkleize(chunks, uint64(len(chunks)), limit)
-	if err != nil {
-		return [32]byte{}, err
-	}
-	return mixInLength(root, output), nil
 }
 
 func determineFieldType(field reflect.StructField) (reflect.Type, error) {

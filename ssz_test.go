@@ -4,11 +4,18 @@ import (
 	"bytes"
 	"encoding/hex"
 	"reflect"
+	"strconv"
 	"sync"
 	"testing"
 
 	"github.com/pkg/errors"
+	"github.com/prysmaticlabs/go-bitfield"
+	"github.com/prysmaticlabs/go-ssz/types"
 )
+
+type beaconState struct {
+	BlockRoots [][]byte `ssz-size:"65536,32"`
+}
 
 type fork struct {
 	PreviousVersion [4]byte
@@ -30,6 +37,99 @@ type truncateWithoutSignatureCase struct {
 type simpleNonProtoMessage struct {
 	Foo []byte
 	Bar uint64
+}
+
+func TestNilElementMarshal(t *testing.T) {
+	type ex struct{}
+	var item *ex
+	buf, err := Marshal(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buf, []byte{}) {
+		t.Errorf("Wanted empty byte slice, got %v", buf)
+	}
+}
+
+func TestNilElementDetermineSize(t *testing.T) {
+	type ex struct{}
+	var item *ex
+	size := types.DetermineSize(reflect.ValueOf(item))
+	if size != 0 {
+		t.Errorf("Wanted size 0, received %d", size)
+	}
+}
+
+// This test verifies if a nil pseudo-array is treated the same as an instantiated,
+// zero-valued array when running hash tree root computations.
+func TestEmptyArrayInstantiation(t *testing.T) {
+	type data struct {
+		DepositRoot  []byte `ssz-size:"32"`
+		DepositCount uint64
+		BlockHash    []byte `ssz-size:"32"`
+	}
+	type example struct {
+		Randao   []byte `ssz-size:"96"`
+		Data     *data
+		Graffiti []byte `ssz-size:"32"`
+	}
+	empty := &example{
+		Randao: make([]byte, 96),
+		Data: &data{
+			DepositRoot:  make([]byte, 32),
+			DepositCount: 0,
+			BlockHash:    make([]byte, 32),
+		},
+	}
+	withInstantiatedArray := &example{
+		Randao: make([]byte, 96),
+		Data: &data{
+			DepositRoot:  make([]byte, 32),
+			DepositCount: 0,
+			BlockHash:    make([]byte, 32),
+		},
+		Graffiti: make([]byte, 32),
+	}
+	r1, err := HashTreeRoot(empty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2, err := HashTreeRoot(withInstantiatedArray)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r1 != r2 {
+		t.Errorf("Wanted nil_array_field = %#x, instiantiated_empty_array_field = %#x", r1, r2)
+	}
+}
+
+func TestMarshalNilArray(t *testing.T) {
+	type ex struct {
+		Slot         uint64
+		Graffiti     []byte `ssz-size:"32"`
+		DepositIndex uint64
+	}
+	b1 := &ex{
+		Slot:         5,
+		Graffiti:     nil,
+		DepositIndex: 64,
+	}
+	b2 := &ex{
+		Slot:         5,
+		Graffiti:     make([]byte, 32),
+		DepositIndex: 64,
+	}
+	enc1, err := Marshal(b1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc2, err := Marshal(b2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(enc1, enc2) {
+		t.Errorf("First item %v != second item %v", enc1, enc2)
+	}
 }
 
 func TestPartialDataMarshalUnmarshal(t *testing.T) {
@@ -197,6 +297,53 @@ func TestHashTreeRoot(t *testing.T) {
 				}
 				if test.err.Error() != err.Error() {
 					t.Errorf("incorrect error: expected %v; received %v", test.err, err)
+				}
+			}
+		})
+	}
+}
+
+func TestHashTreeRootBitlist(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       bitfield.Bitlist
+		maxCapacity uint64
+		output      []byte
+		err         error
+	}{
+		{
+			name:        "Nil",
+			input:       nil,
+			maxCapacity: 0,
+			// Hash([]byte{})
+			output: hexDecodeOrDie(t, "f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b"),
+			err:    nil,
+		},
+		{
+			name:        "SampleBitlist",
+			input:       bitfield.Bitlist{1, 2, 3},
+			maxCapacity: 4,
+			// Known output hash.
+			output: hexDecodeOrDie(t, "835e878350f244651619cbac69de3002251be60225ba0d6ac999b5becb469281"),
+			err:    nil,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			output, err := HashTreeRootBitlist(test.input, test.maxCapacity)
+			if test.err == nil {
+				if err != nil {
+					t.Fatalf("unexpected error %v", err)
+				}
+				if bytes.Compare(test.output[:], output[:]) != 0 {
+					t.Errorf("incorrect output: expected %#x; received %#x", test.output, output)
+				}
+			} else {
+				if err == nil {
+					t.Fatalf("missing expected error %v", test.err)
+				}
+				if test.err.Error() != err.Error() {
+					t.Errorf("incorrect error: expected %#x; received %#x", test.err, err)
 				}
 			}
 		})
@@ -560,4 +707,80 @@ func TestSigningRoot_ConcurrentAccess(t *testing.T) {
 		}(t, &wg)
 	}
 	wg.Wait()
+}
+
+func BenchmarkSSZ_NoCache(b *testing.B) {
+	b.StopTimer()
+	bs := &beaconState{
+		BlockRoots: make([][]byte, 65536),
+	}
+	for i := 0; i < len(bs.BlockRoots); i++ {
+		newItem := [32]byte{1, 2, 3}
+		bs.BlockRoots[i] = newItem[:]
+	}
+	b.StartTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := HashTreeRoot(bs); err != nil {
+			b.Fatal(err)
+		}
+	}
+	types.ToggleCache(true)
+}
+
+func BenchmarkSSZ_WithCache(b *testing.B) {
+	b.StopTimer()
+	types.ToggleCache(true)
+	bs := &beaconState{
+		BlockRoots: make([][]byte, 65536),
+	}
+	for i := 0; i < len(bs.BlockRoots); i++ {
+		newItem := [32]byte{1, 2, 3}
+		bs.BlockRoots[i] = newItem[:]
+	}
+	b.StartTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := HashTreeRoot(bs); err != nil {
+			b.Fatal(err)
+		}
+	}
+	types.ToggleCache(false)
+}
+
+func BenchmarkSSZ_SingleElementChanged(b *testing.B) {
+	b.StopTimer()
+	types.ToggleCache(true)
+	bs := &beaconState{
+		BlockRoots: make([][]byte, 65536),
+	}
+	for i := 0; i < len(bs.BlockRoots); i++ {
+		newItem := [32]byte{1, 2, 3}
+		bs.BlockRoots[i] = newItem[:]
+	}
+	if _, err := HashTreeRoot(bs); err != nil {
+		b.Fatal(err)
+	}
+	b.StartTimer()
+	for i := 0; i < b.N; i++ {
+		newItem := []byte(strconv.Itoa(i))
+		newRoot := toBytes32(newItem)
+		bs.BlockRoots[i%len(bs.BlockRoots)] = newRoot[:]
+		if _, err := HashTreeRoot(bs); err != nil {
+			b.Fatal(err)
+		}
+	}
+	types.ToggleCache(false)
+}
+
+func toBytes32(x []byte) [32]byte {
+	var y [32]byte
+	copy(y[:], x)
+	return y
+}
+
+func hexDecodeOrDie(t *testing.T, s string) []byte {
+	res, err := hex.DecodeString(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return res
 }

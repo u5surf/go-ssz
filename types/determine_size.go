@@ -10,7 +10,7 @@ import (
 func DetermineSize(val reflect.Value) uint64 {
 	if val.Kind() == reflect.Ptr {
 		if val.IsNil() {
-			return DetermineSize(reflect.New(val.Type()).Elem())
+			return DetermineSize(reflect.New(val.Type().Elem()).Elem())
 		}
 		return DetermineSize(val.Elem())
 	}
@@ -31,6 +31,13 @@ func isBasicType(kind reflect.Kind) bool {
 
 func isBasicTypeArray(typ reflect.Type, kind reflect.Kind) bool {
 	return kind == reflect.Array && isBasicType(typ.Elem().Kind())
+}
+
+func isRootsArray(val reflect.Value, typ reflect.Type) bool {
+	elemTyp := typ.Elem()
+	elemKind := elemTyp.Kind()
+	isByteArray := elemKind == reflect.Array && elemTyp.Elem().Kind() == reflect.Uint8
+	return isByteArray && val.Index(0).Len() == 32
 }
 
 func isVariableSizeType(typ reflect.Type) bool {

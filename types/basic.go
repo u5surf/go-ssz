@@ -1,20 +1,28 @@
 package types
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"reflect"
 	"sync"
+	"time"
+
+	"github.com/karlseguin/ccache"
+	"github.com/prysmaticlabs/go-bitfield"
 )
 
+// BasicTypeCacheSize for HashTreeRoot.
+const BasicTypeCacheSize = 100000
+
 type basicSSZ struct {
-	hashCache map[string]interface{}
+	hashCache *ccache.Cache
 	lock      sync.Mutex
 }
 
 func newBasicSSZ() *basicSSZ {
 	return &basicSSZ{
-		hashCache: make(map[string]interface{}),
+		hashCache: ccache.New(ccache.Configure().MaxSize(BasicTypeCacheSize)),
 	}
 }
 
@@ -66,20 +74,54 @@ func (b *basicSSZ) Unmarshal(val reflect.Value, typ reflect.Type, buf []byte, st
 	}
 }
 
-func (b *basicSSZ) Root(val reflect.Value, typ reflect.Type, maxCapacity uint64) ([32]byte, error) {
+// BitlistRoot computes the hash tree root of a bitlist type as outlined in the
+// Simple Serialize official specification document.
+func BitlistRoot(bfield bitfield.Bitlist, maxCapacity uint64) ([32]byte, error) {
+	limit := (maxCapacity + 255) / 256
+	if bfield == nil {
+		length := make([]byte, 32)
+		root, err := bitwiseMerkleize([][]byte{}, 0, limit)
+		if err != nil {
+			return [32]byte{}, err
+		}
+		return mixInLength(root, length), nil
+	}
+	chunks, err := pack([][]byte{bfield.Bytes()})
+	if err != nil {
+		return [32]byte{}, err
+	}
+	buf := new(bytes.Buffer)
+	if err := binary.Write(buf, binary.LittleEndian, bfield.Len()); err != nil {
+		return [32]byte{}, err
+	}
+	output := make([]byte, 32)
+	copy(output, buf.Bytes())
+	root, err := bitwiseMerkleize(chunks, uint64(len(chunks)), limit)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	return mixInLength(root, output), nil
+}
+
+func (b *basicSSZ) Root(val reflect.Value, typ reflect.Type, fieldName string, maxCapacity uint64) ([32]byte, error) {
 	var chunks [][]byte
 	var err error
 	var hashKey string
-	buf := make([]byte, DetermineSize(val))
-	if _, err := b.Marshal(val, typ, buf, 0); err != nil {
+	newVal := reflect.New(val.Type()).Elem()
+	newVal.Set(val)
+	if val.Type().Kind() == reflect.Slice && val.IsNil() {
+		newVal.Set(reflect.MakeSlice(val.Type(), typ.Len(), typ.Len()))
+	}
+	buf := make([]byte, DetermineSize(newVal))
+	if _, err := b.Marshal(newVal, typ, buf, 0); err != nil {
 		return [32]byte{}, err
 	}
 	hashKey = string(buf)
 	b.lock.Lock()
-	res := b.hashCache[hashKey]
+	res := b.hashCache.Get(string(hashKey))
 	b.lock.Unlock()
-	if res != nil {
-		return res.([32]byte), nil
+	if res != nil && res.Value() != nil {
+		return res.Value().([32]byte), nil
 	}
 
 	// In order to find the root of a basic type, we simply marshal it,
@@ -94,7 +136,7 @@ func (b *basicSSZ) Root(val reflect.Value, typ reflect.Type, maxCapacity uint64)
 		return [32]byte{}, err
 	}
 	b.lock.Lock()
-	b.hashCache[hashKey] = root
+	b.hashCache.Set(string(hashKey), root, time.Hour)
 	b.lock.Unlock()
 	return root, nil
 }
@@ -112,11 +154,16 @@ func (b *basicSSZ) marshalBasicArray(val reflect.Value, typ reflect.Type, buf []
 }
 
 func marshalByteArray(val reflect.Value, typ reflect.Type, buf []byte, startOffset uint64) (uint64, error) {
-	if val.Type().Kind() == reflect.Array {
+	if val.Kind() == reflect.Array {
 		for i := 0; i < val.Len(); i++ {
 			buf[int(startOffset)+i] = uint8(val.Index(i).Uint())
 		}
 		return startOffset + uint64(val.Len()), nil
+	}
+	if val.IsNil() {
+		item := make([]byte, typ.Len())
+		copy(buf[startOffset:], item)
+		return startOffset + uint64(typ.Len()), nil
 	}
 	copy(buf[startOffset:], val.Bytes())
 	return startOffset + uint64(val.Len()), nil

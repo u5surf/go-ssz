@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/pkg/errors"
+	"github.com/prysmaticlabs/go-bitfield"
 	"github.com/prysmaticlabs/go-ssz/types"
 )
 
@@ -56,8 +57,11 @@ func Marshal(val interface{}) ([]byte, error) {
 		return nil, err
 	}
 	if rval.Type().Kind() == reflect.Ptr {
-		if _, err := factory.Marshal(rval.Elem(), rval.Elem().Type(), buf, 0 /* start offset */); err != nil {
-			return nil, errors.Wrapf(err, "failed to marshal for type: %v", rval.Elem().Type())
+		if rval.IsNil() {
+			return buf, nil
+		}
+		if _, err := factory.Marshal(rval.Elem(), rval.Type().Elem(), buf, 0 /* start offset */); err != nil {
+			return nil, errors.Wrapf(err, "failed to marshal for type: %v", rval.Type().Elem())
 		}
 		return buf, nil
 	}
@@ -129,7 +133,12 @@ func HashTreeRoot(val interface{}) ([32]byte, error) {
 	if err != nil {
 		return [32]byte{}, errors.Wrapf(err, "could not generate tree hasher for type: %v", rval.Type())
 	}
-	return factory.Root(rval, rval.Type(), 0)
+	return factory.Root(rval, rval.Type(), "", 0)
+}
+
+// HashTreeRootBitlist determines the root hash of a bitfield.Bitlist type using SSZ's Merkleization.
+func HashTreeRootBitlist(bfield bitfield.Bitlist, maxCapacity uint64) ([32]byte, error) {
+	return types.BitlistRoot(bfield, maxCapacity)
 }
 
 // HashTreeRootWithCapacity determines the root hash of a dynamic list
@@ -153,7 +162,7 @@ func HashTreeRootWithCapacity(val interface{}, maxCapacity uint64) ([32]byte, er
 	if err != nil {
 		return [32]byte{}, errors.Wrapf(err, "could not generate tree hasher for type: %v", rval.Type())
 	}
-	return factory.Root(rval, rval.Type(), maxCapacity)
+	return factory.Root(rval, rval.Type(), "", maxCapacity)
 }
 
 // SigningRoot truncates the last property of the struct passed in
